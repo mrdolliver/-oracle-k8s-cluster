@@ -1,0 +1,176 @@
+K8s_Cluster_on_Oracle_cloud
+
+Internet
+  | Public IP: 132.145.154.58
+  | 
+  |---[SSH]----------------------------→ Bastion Host (10.0.4.178)
+  |                                       |
+  |                                       | SSH to Control/Worker Nodes
+  |                                       v
+  |                                 +---------------------+
+  |                                 | Bastion Host        | (hostname: k8s-bastion-new2)
+  |                                 | Subnet: 10.0.4.0/24 |
+  |                                 +---------------------+
+  |                                       |
+  |                                       |
+  |---[Kube API (kubectl) TCP 6443]---------→ Private Load Balancer (10.0.3.78)
+                                          |
+                                          v
+                                    +-------------------------+
+                                    | k8s-private-lb          |
+                                    | TCP 6443 → Control Plane|
+                                    +-------------------------+
+                                               |
+                                               |
+                                               v
+                                        +---------------------+
+                                        | NAT Gateway         |
+                                        | For Internet Access |
+                                        +---------------------+
+                                               ^
+                                               |
+                             [Outbound Pod Traffic (image pulls, curl, etc.)]
+                                               |
++-----------------------------------------------------------------------------------+
+| VCN (ocid1.vcn.oc1.iad.amaaaaaa...)                                               |
+| Subnet: new-node-subnet-ad1 (10.0.3.0/24)                                         |
+|                                                                                   |
+| +----------------+ +----------------+ +-------------------+ +-------------------+ |
+| | k8s-node-1     | | k8s-node-2     | | k8s-worker-node-1 | | k8s-worker-node-2 | |
+| | 10.0.3.88      | | 10.0.3.198     | | 10.0.3.36         | | 10.0.3.120        | |
+| | Control Plane  | | Control Plane  | | Worker            | | Worker            | |
+| +----------------+ +----------------+ +-------------------+ +-------------------+ | 
+|     |                                                                             |
+|     +-----------------------------→ (Northbound route to NAT Gateway)             |
++-----------------------------------------------------------------------------------+
+
+* Legend:
+  - SSH (TCP 22) from Internet to Bastion Host
+  - Bastion Host → SSH to internal nodes (k8s-node*, worker-node*)
+  - Load Balancer handles external access to Kubernetes API (TCP 6443)
+  - NAT Gateway provides outbound Internet from nodes (northbound traffic)
+
+
+### Table of Relevant OCIDs###
+
+|Name               |Role         |Private IP |                                                                                  
+|-------------------|-------------|-----------|-------------------------------------------------|---------------------------------------------|
+|k8s-bastion-new2   |Bastion Host |10.0.4.178 |
+
+ocid1.instance.oc1.iad.anuwcljsbtwfb2ic2vywtnjzn3ymekhlxeblf4qbi46ochjc6kvqvnyhew3q    |
+
+
+|k8s-node-1         |Control Plane|10.0.3.88  |ssh -i ~/.ssh/oke_bastion_key opc@10.0.3.88 
+
+ocid1.instance.oc1.iad.anuwcljsbtwfb2icxkbrtx5yq56ssr6fpwd3s2oko3v5seecuggd344yj6bq    |
+
+|k8s-node-2         |Control Plane|10.0.3.198 |ssh -i ~/.ssh/oke_bastion_keyopc@10.0.3.198 
+
+ocid1.instance.oc1.iad.anuwcljsbtwfb2ic37xpivgohrqjqa2wz5iwwpaacrmuk7zfq3ydewfe7t4a    |
+
+|k8s-worker-node-1  |Worker       |10.0.3.36  |ssh -i ~/.ssh/oke_bastion_keyopc@10.0.3.36 
+
+ocid1.instance.oc1.iad.anuwcljsbtwfb2iclx5jc5vyi7guq56ju77ucutj26cunfvn7wibrkkez3eq    |
+
+|k8s-worker-node-2  |Worker       |10.0.3.120 |ssh -i ~/.ssh/oke_bastion_keyopc@10.0.3.120 
+
+ocid1.instance.oc1.iad.anuwcljsbtwfb2icvkkni3hbrzfkqseyc35tyzcekukd2fuwelcisx2fdx6a    |
+
+|new-node-subnet-ad1|Subnet       |10.0.3.0/24|ocid1.subnet.oc1.iad.aaaaaaaavphcjefwl3pwnnovt7qo6hi66hpgc3ue3da4omguexrxkmgcpw2q      |
+
+|Security List      |Security List|-          |ocid1.securitylist.oc1.iad.aaaaaaaal6omcvf2z4cmyrhhj5t6qkewzcl7wjk4ylrmltnmv6odf5twdo6q|
+
+|VCN                |VCN          |          |ocid1.vcn.oc1.iad.amaaaaaabtwfb2iaytvxtqezbpylnxo5o6jouytlmaxlyzt6fb3uc7cca2lq         |
+* Note:
+  - Flannel CNI provides pod-to-pod networking across nodes using VXLAN overlay.
+  - Pod IPs are routed over the node interfaces, encapsulated via flannel.
+
+### Instance Descriptions
+
+- **k8s-bastion-new2**: Bastion host with a public IP used to SSH into internal OCI instances. Deployed in public subnet (10.0.4.0/24).
+- **k8s-node-1 & k8s-node-2**: Kubernetes control plane nodes. Run `kube-apiserver`, `etcd`, scheduler, and controller-manager.
+- **k8s-worker-node-1 & k8s-worker-node-2**: Kubernetes worker nodes where application pods are scheduled. Also run kubelet and kube-proxy.
+- **k8s-private-lb**: OCI private load balancer listening on TCP 6443. Routes traffic to control plane nodes for API access.
+- **NAT Gateway**: Allows outbound internet access for nodes in private subnets (e.g., pulling images from Docker Hub).
+
+## NodePort Access Flow
+
+  Internet
+    |
+    |--[App TCP 30080]--> Node Public IP (if exposed)
+                                |
+                                v
+                        +------------------+
+                        | k8s-worker-node-*|
+                        | NodePort Service |
+                        +------------------+
+                                |
+                                v
+                         +--------------+
+                         | Target Pod(s)|
+                         +--------------+
+
+
+## Ingress Access Flow (e.g., nginx-ingress)
+
+  Internet
+    |
+    |--[HTTP/HTTPS TCP 80/443]--> Ingress Controller
+                                 (Running as Pod on Node)
+                                |
+                                v
+                     +--------------------------+
+                     | nginx-ingress-controller |
+                     +--------------------------+
+                                |
+                                v
+                       +------------------+
+                       | Target Services  |
+                       +------------------+
+                                |
+                                v
+                          +-----------+
+                          | Pod(s)    |
+                          +-----------+
+
+
+## Port & Access Summary
+
+| Port       | Protocol | Purpose                           | Source → Target                                
+|------------|----------|----------------------------------|--------------------------------------------|
+| 22         | TCP      | SSH to Bastion Host              | Internet → Bastion                         |
+| 6443       | TCP      | Kubernetes API (kubectl access)  | Internet → LB → Control Plane (API Server) |
+| 80, 443    | TCP      | HTTP/HTTPS (Ingress Controller)  | Internet → Node/Pod (Ingress Cntroller     |
+| 30000–32767| TCP      | NodePort Range (default)         | Internet → Worker Node (NodePort Service)  |
+|-------------------------------------------------------------------------------------------------------|
+
+## Deployment Workflow
+
+User
+  |
+  |---> kubectl apply -f deployment.yaml
+                             |
+                             v
+                    +-------------------+
+                    | Kubernetes Control|
+                    | Plane (API Server)|
+                    +-------------------+
+                             |
+                             v
+                    +-------------------+
+                    | Scheduler, etc.   |
+                    +-------------------+
+                             |
+                             v
+                    +-------------------+
+                    | Pod runs on Node  |
+                    +-------------------+
+                             |
+                             v
+           +-----------------+----------------+
+           | Optionally exposed via:          |
+           | - ClusterIP                      |
+           | - NodePort                       |
+           | - LoadBalancer (LB Service)      |
+           | - Ingress Controller (nginx)     |
+           +----------------------------------+

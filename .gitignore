@@ -1,0 +1,13 @@
+# macOS system files
+.DS_Store
+
+# Editor and swap files
+*.swp
+*.swo
+*~
+
+# VS Code settings (optional)
+.vscode/
+
+# Logs
+*.log

@@ -1,0 +1,109 @@
+Kubernetes Logging & Inspection Guide (Node + Pod Level)
+==========================================================
+
+This guide contains essential commands and tools for inspecting logs in a Kubernetes cluster.
+Covers node-level logging (systemd/journalctl), Kubernetes component logs, and pod/application logs.
+
+-----------------------------------------------------
+Node-Level Logs (systemd, journald, container runtime)
+-----------------------------------------------------
+
+# View system-wide logs (entire journal)
+sudo journalctl -xe
+
+# View logs for kubelet service
+sudo journalctl -u kubelet
+
+# View logs for containerd service
+sudo journalctl -u containerd
+
+# Show logs for last boot only
+sudo journalctl -b
+
+# Live follow of kubelet logs
+sudo journalctl -u kubelet -f
+
+# Filter logs by timestamp range
+sudo journalctl --since "1 hour ago" --until "10 minutes ago"
+
+-----------------------------------------------------
+Kubernetes Control Plane Logs (if on self-managed nodes)
+-----------------------------------------------------
+
+# View kube-apiserver logs (control plane only)
+sudo journalctl -u kube-apiserver
+
+# View controller-manager logs
+sudo journalctl -u kube-controller-manager
+
+# View scheduler logs
+sudo journalctl -u kube-scheduler
+
+Note:
+These services only run on control plane nodes.
+
+-----------------------------------------------------
+Pod-Level Logs (kubectl)
+-----------------------------------------------------
+
+# View logs of a specific pod
+kubectl logs <pod-name>
+
+# View logs from a specific container in a pod
+kubectl logs <pod-name> -c <container-name>
+
+# Follow live logs
+kubectl logs -f <pod-name>
+
+# Get previous logs from a restarted pod
+kubectl logs <pod-name> --previous
+
+# Logs from a pod in another namespace
+kubectl logs -n <namespace> <pod-name>
+
+-----------------------------------------------------
+Pod Events & Status Info
+-----------------------------------------------------
+
+# Describe pod to view events, reasons, and statuses
+kubectl describe pod <pod-name>
+
+# List recent events in the cluster
+kubectl get events --sort-by=.metadata.creationTimestamp
+
+-----------------------------------------------------
+Troubleshooting Tips
+-----------------------------------------------------
+
+- Use `kubectl get pods -o wide` to identify node location for a pod.
+- Check node health: `kubectl get nodes` + `kubectl describe node <name>`
+- Use `kubectl top` (via metrics-server) for resource usage.
+- Persistent logs require external logging stack (e.g., Loki, ELK, Fluentd).
+- Systemd logs are ephemeral unless persisted via config.
+
+-----------------------------------------------------
+Log Filtering & Tail Examples
+-----------------------------------------------------
+
+# Filter logs for a specific keyword
+kubectl logs <pod-name> | grep "error"
+
+# View logs from last 1 hour
+kubectl logs --since=1h <pod-name>
+
+# View logs since a specific timestamp
+kubectl logs --since-time="2025-08-03T14:00:00Z" <pod-name>
+
+# View only the last 100 lines of logs
+kubectl logs --tail=100 <pod-name>
+
+# Follow logs and filter live for string
+kubectl logs -f <pod-name> | grep "GET /healthz"
+
+# Combine grep + timestamp filtering
+kubectl logs <pod-name> | grep "2025-08-03T14"
+
+Notes:
+- Log filtering relies on your app emitting timestamps.
+- Consider using `jq` or `awk` for structured JSON log filtering.
+- Use `--container <name>` if multiple containers exist in the pod.

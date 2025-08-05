@@ -1,0 +1,187 @@
+
+K8s Cluster Connectivity & Network Testing Guide
+=================================================
+
+This guide provides a structured set of commands to verify Kubernetes cluster connectivity and network flow across Oracle Cloud Infrastructure (OCI). Each section corresponds to an OSI layer.
+
+-----------------------------------------------------
+Layer 2: Link Layer / Neighbor Discovery
+-----------------------------------------------------
+
+# Show ARP table entries to identify known layer 2 neighbors
+Command:
+  ip neigh
+
+Explanation:
+  Displays the ARP cache, mapping IPs to MAC addresses.
+
+Expected Output:
+  10.0.3.198 dev ens3 lladdr 02:xx:xx:xx:xx:xx REACHABLE
+
+
+# Show local network interfaces and MAC addresses
+Command:
+  ip link show
+
+Explanation:
+  Lists all interfaces and their MAC layer info.
+
+Expected Output:
+  Includes interface name (e.g., ens3), state (UP), and MAC address.
+
+
+# Trigger ARP resolution by pinging a known peer
+Command:
+  ping -c 1 10.0.3.198
+  arp -n
+
+Explanation:
+  Sends one ICMP echo request to populate ARP table.
+
+Expected Output:
+  Ping shows 1 packet transmitted/received.
+  arp -n shows resolved MAC for 10.0.3.198.
+
+
+# Capture ARP or ICMP traffic on interface
+Command:
+  sudo tcpdump -i ens3 -e arp or icmp
+
+Explanation:
+  Captures L2 traffic with MAC headers (-e) filtered for ARP or ICMP.
+
+Expected Output:
+  Live packet capture showing Ethernet src/dst, protocol, etc.
+
+-----------------------------------------------------
+Layer 3: Routing & IP Reachability
+-----------------------------------------------------
+
+# View routing table
+Command:
+  ip route show
+
+Explanation:
+  Lists default gateway, subnet routes, and next-hop targets.
+
+Expected Output:
+  Default route via 10.0.3.1 dev ens3
+
+
+# Test connectivity to another control plane or worker
+Command:
+  ping -c 3 10.0.3.198
+
+Explanation:
+  Sends 3 ICMP requests to a peer node.
+
+Expected Output:
+  3 packets transmitted, 3 received, time stats shown.
+
+
+# Trace path to NAT gateway or Internet IP
+Command:
+  traceroute 10.0.3.1
+  traceroute 8.8.8.8
+
+Explanation:
+  Displays hop-by-hop routing path.
+
+Expected Output:
+  1st hop: NAT GW / 10.0.3.1; subsequent: OCI core, then Internet
+
+
+# Verify worker-to-control API server ping
+Command:
+  ping -c 3 10.0.3.88
+
+Expected Output:
+  3 successful responses from control plane node.
+
+-----------------------------------------------------
+Layer 4: Port & Service Connectivity
+-----------------------------------------------------
+
+# Check kube-apiserver port directly
+Command:
+  ncat -v 10.0.3.88 6443
+
+Explanation:
+  Tries TCP connection to kube-apiserver.
+
+Expected Output:
+  Ncat: Connected to 10.0.3.88:6443 or timeout/refused if blocked.
+
+
+# Verify LB forwarding to control plane
+Command:
+  ncat -v 10.0.3.78 6443
+
+Expected Output:
+  Connected — indicates LB is forwarding correctly to backends.
+
+
+# List local listening sockets
+Command:
+  ss -tuln
+
+Explanation:
+  Shows all active TCP/UDP listeners on node.
+
+Expected Output:
+  Includes :6443 on control planes, kubelet/kube-proxy ports, etc.
+
+
+# Check OCI firewall status and rules
+Command:
+  sudo firewall-cmd --state
+  sudo iptables -L -n
+
+Expected Output:
+  `not running` for firewalld; ACCEPT or DROP rules in iptables.
+
+-----------------------------------------------------
+Layer 7: Application & HTTP Testing
+-----------------------------------------------------
+
+# Confirm external internet access
+Command:
+  curl -I https://google.com
+
+Explanation:
+  Sends HTTP HEAD request to test outbound connectivity.
+
+Expected Output:
+  HTTP/2 200 or HTTP/1.1 302 redirect.
+
+
+# Test direct API server response
+Command:
+  curl -k https://10.0.3.88:6443/version
+
+Explanation:
+  -k skips SSL verification.
+  /version returns Kubernetes version JSON.
+
+Expected Output:
+  { "major": "...", "minor": "...", "gitVersion": "v1.29.15" }
+
+
+# From pod: test cluster DNS
+Command:
+  kubectl run busybox --rm -it --image=busybox --restart=Never -- nslookup kubernetes.default
+
+Explanation:
+  Runs temporary pod to resolve Kubernetes service.
+
+Expected Output:
+  Name: kubernetes.default.svc.cluster.local
+  Address: 10.96.0.1 (or similar)
+
+
+# From pod: test service endpoint (e.g., NGINX)
+Command:
+  kubectl exec -it <pod-name> -- curl -s http://nginx.default.svc.cluster.local
+
+Expected Output:
+  HTML from NGINX home page or custom app.

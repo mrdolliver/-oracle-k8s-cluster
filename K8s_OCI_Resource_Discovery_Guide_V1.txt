@@ -1,0 +1,116 @@
+
+Oracle Cloud Infrastructure (OCI) - Metadata & Resource Discovery
+=================================================================
+
+Notes:
+- Replace placeholders like <compartment_ocid> or <instance_ocid> as needed.
+- Use --output json if you prefer programmatic output.
+- Add --all when listing multiple items to avoid pagination limits.
+
+This guide provides essential OCI CLI commands for collecting metadata, OCIDs, and network details about your infrastructure.
+
+-----------------------------------------------------
+1. List All Compute Instances in Compartment
+-----------------------------------------------------
+
+Command:
+  oci compute instance list --compartment-id <compartment_ocid> --all \
+    --query "data[].{Name:\"display-name\", OCID:id, State: 'lifecycle-state'}" \
+    --output table
+
+Purpose:
+  Shows instance names, OCIDs, and lifecycle state.
+
+-----------------------------------------------------
+2. Get Full Details of a Specific Instance
+-----------------------------------------------------
+
+Command:
+  oci compute instance get --instance-id <instance_ocid>
+
+Purpose:
+  Displays complete metadata: shape, AD, tags, source image, etc.
+
+-----------------------------------------------------
+3. List VNIC Attachments for an Instance
+-----------------------------------------------------
+
+Command:
+  oci compute instance list-vnic-attachments --compartment-id <compartment_ocid> \
+    --instance-id <instance_ocid>
+
+Purpose:
+  Lists primary VNIC IDs attached to the instance.
+
+-----------------------------------------------------
+4. Get VNIC Details (Private IP, Subnet, Hostname)
+-----------------------------------------------------
+
+Command:
+  oci network vnic get --vnic-id <vnic_ocid>
+
+Purpose:
+  Shows private IP, subnet OCID, and public IP (if any).
+
+-----------------------------------------------------
+5. List All Subnets in a VCN
+-----------------------------------------------------
+
+Command:
+  oci network subnet list --compartment-id <compartment_ocid> \
+    --vcn-id <vcn_ocid> --output table
+
+Purpose:
+  Enumerates subnet CIDRs, route table OCIDs, ADs.
+
+-----------------------------------------------------
+6. Show Route Table Details
+-----------------------------------------------------
+
+Command:
+  oci network route-table get --rt-id <route_table_ocid>
+
+Purpose:
+  Verifies routing paths (e.g., 0.0.0.0/0 → NAT GW or Internet GW).
+
+-----------------------------------------------------
+7. Show Security List Rules
+-----------------------------------------------------
+
+Command:
+  oci network security-list get --security-list-id <security_list_ocid>
+
+Purpose:
+  Review open ports for ingress/egress.
+
+-----------------------------------------------------
+8. List Load Balancers in Compartment
+-----------------------------------------------------
+
+Command:
+  oci lb load-balancer list --compartment-id <compartment_ocid> \
+    --query "data[].{Name:\"display-name\", OCID:id, IP:\"ip-addresses\"}" \
+    --output table
+
+Purpose:
+  View LB names, IPs, and OCIDs.
+
+-----------------------------------------------------
+9. List Load Balancer Backend Sets
+-----------------------------------------------------
+
+Command:
+  oci lb backend-set list --load-balancer-id <lb_ocid>
+
+Purpose:
+  Lists backend sets and policies for a specific load balancer.
+
+-----------------------------------------------------
+10. List Available Shapes for Compute
+-----------------------------------------------------
+
+Command:
+  oci compute shape list --compartment-id <compartment_ocid> --output table
+
+Purpose:
+  See available VM shapes for current region.
