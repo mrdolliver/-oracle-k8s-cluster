@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tol-app
+  namespace: cka-labs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tol-app
+  template:
+    metadata:
+      labels:
+        app: tol-app
+    spec:
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "lab"
+        effect: "NoSchedule"
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10

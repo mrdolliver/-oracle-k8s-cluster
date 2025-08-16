@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+  namespace: cka-labs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shop
+  template:
+    metadata:
+      labels:
+        app: shop
+    spec:
+      containers:
+      - name: shop
+        image: hashicorp/http-echo:1.0
+        args: ["-text=hello"]
+        ports:
+        - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+  namespace: cka-labs
+spec:
+  selector:
+    app: shop
+  ports:
+  - port: 80
+    targetPort: 5678
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: cka-labs
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /shop
+        pathType: Prefix
+        backend:
+          service:
+            name: shop
+            port:
+              number: 80
