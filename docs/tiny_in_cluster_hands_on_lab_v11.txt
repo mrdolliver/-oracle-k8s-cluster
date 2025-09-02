@@ -1,0 +1,876 @@
+Tiny In‑Cluster Demo — Oracle Cloud K8s
+Version: v1.0
+Author: Robert Dolliver
+Date: (fill in)
+Acknowlegements: ChapGPT, Oracle documentation. 
+Sources:
+- Oracle Cloud Infrastructure Documentation: https://docs.oracle.com/iaas/Content/home.htm
+- Oracle Kubernetes (OKE / kubeadm) Guidance: https://docs.oracle.com/en/solutions/kubernetes-cluster/index.html
+
+
+======================================================================
+Table of Contents
+----------------------------------------------------------------------
+1) Preflight Checks
+Confirm cluster access, namespace, and baseline readiness.
+2) Config (ConfigMap + Secret)
+3) Backend (tiny API)
+4) Frontend (serves static + proxies /api)
+5) Frontend + OCI LB Integration (Free Tier Safe Path)
+6) Ingress (optional, if you prefer a single hostname)
+Optional ingress controller and resource for hostname-based routing.
+7) Autoscaling (HPA on backend)
+Add HPA to scale backend based on CPU utilization.
+8) Observability & Introspection
+Inspect objects, services, and logs for debugging and validation.
+9) Cleanup
+10) Scratchpad / Findings
+Appendix A) Free-Tier External Access Options
+Appendix B) Troubleshooting Guide
+Appendix C) End-to-End Verification Checklist
+======================================================================
+
+======================================================================
+Introduction
+----------------------------------------------------------------------
+This document covers configuration of a tiny but complete frontend and backend demo you
+can deployed on an free tier Oracle Cloud kubeadm cluster (2 CP, 2 workers).
+It defines Deployments, Services, Ingress, ConfigMap, Secret, and HPA.
+
+You’ll apply each section in order. Copy/paste blocks exactly as shown.
+Keep notes at the end of each section (success, issues, fixes).
+
+Cluster assumptions:
+- kubectl context points to your Oracle K8s cluster
+- You have cluster-admin permissions on the cluster
+- Nodes have outbound Internet to pull images
+- (Optional) An OCI LB is available if using Service type LoadBalancer
+
+Namespace used in this demo:
+- demo
+
+
+
+Architecture (OCI + Demo Integrated View)
+----------------------------------------------------------------------
+Internet
+  | Public IP: <your_public_ip>
+  | 
+  |---[SSH]----------------------------→ Bastion Host (10.0.4.x)   [6]
+  |                                       |
+  |                                       | SSH to Control/Worker Nodes
+  |                                       v
+  |                                 +---------------------+
+  |                                 | Bastion Host        |
+  |                                 | Subnet: 10.0.4.0/24 |
+  |                                 +---------------------+
+  |                                       |
+  |---[Kube API (kubectl) TCP 6443]---------→ Private Load Balancer (10.0.3.x)
+                                          |
+                                          v
+                                    +-------------------------+
+                                    | k8s-private-lb          |
+                                    | TCP 6443 → Control Plane|
+                                    +-------------------------+
+                                               |
+                                               v
+                                        +---------------------+
+                                        | NAT Gateway         |
+                                        | For Internet Access |
+                                        +---------------------+
+                                               ^
+                                               |
+                             [Outbound Pod Traffic (image pulls, curl, etc.)]
+                                               |
++-----------------------------------------------------------------------------------+
+| VCN (10.0.3.0/24)                                                                 |
+|                                                                                   |
+| +----------------+ +----------------+ +-------------------+ +-------------------+ |
+| | k8s-node-1     | | k8s-node-2     | | k8s-worker-node-1 | | k8s-worker-node-2 | |
+| | 10.0.3.88      | | 10.0.3.198     | | 10.0.3.36         | | 10.0.3.120        | |
+| | Control Plane  | | Control Plane  | | Worker            | | Worker            | |
+| +----------------+ +----------------+ +-------------------+ +-------------------+ |
+|                                                                                   |
+|   Worker Nodes (App Layer):                                                       |
+|   [1] Frontend Pod (curl Pod IP)                                                 |
+|   [2] Frontend Service (ClusterIP)                                               |
+|   [3] DNS: frontend.demo.svc.cluster.local                                       |
+|                                                                                   |
+|   +------------------+       /api       +------------------+                      |
+|   | Frontend (nginx) |----------------->| Backend (FastAPI)|                      |
+|   | proxies /api     |                  | tiny API service |                      |
+|   +------------------+                  +------------------+                      |
+|                                                                                   |
+|   Northbound External Entry Points inside VCN:                                    |
+|   [4] NodePort 30080 on worker nodes (VCN reachability)                          |
+|   [5] OCI Private LB → backend set (targets 30080 on workers)                     |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+
+External Access Aids
+----------------------------------------------------------------------
+[6] Bastion Host SSH tunnel for laptop access (to NodePort) or kubectl port-forward
+
+Notes:
+- Steps [1]–[3] validate in-cluster networking (Pod → Service → DNS).
+- Step [4] validates NodePort reachability inside the VCN.
+- Step [5] validates OCI Private LB path to the frontend via NodePort 30080.
+- Step [6] enables external laptop access via Bastion (SSH tunnel) or kubectl port-forward.
+- Frontend proxies `/api` calls to backend; NAT handles outbound image pulls.
+
+Table of Relevant OCIDs
+----------------------------------------------------------------------
+|Name               |Role         |Private IP |
+|-------------------|-------------|-----------|-------------------------------------------------|
+|k8s-bastion-new2   |Bastion Host |10.0.4.178 | ocid1.instance.oc1...                           |
+|k8s-node-1         |Control Plane|10.0.3.88  | ocid1.instance.oc1...                           |
+|k8s-node-2         |Control Plane|10.0.3.198 | ocid1.instance.oc1...                           |
+|k8s-worker-node-1  |Worker       |10.0.3.36  | ocid1.instance.oc1...                           |
+|k8s-worker-node-2  |Worker       |10.0.3.120 | ocid1.instance.oc1...                           |
+|new-node-subnet-ad1|Subnet       |10.0.3.0/24| ocid1.subnet.oc1...                             |
+|Security List      |Security List|-          | ocid1.securitylist.oc1...                       |
+|VCN                |VCN          | -         | ocid1.vcn.oc1...                                |
+
+
+
+==== PAGE BREAK ====
+======================================================================
+1) Preflight Checks
+Confirm cluster access, namespace, and baseline readiness.
+----------------------------------------------------------------------
+# 1.1 Verify cluster access
+kubectl cluster-info
+kubectl get nodes -o wide
+
+# 1.2 Create namespace
+kubectl create ns demo
+
+# 1.3 Confirm namespace exists
+kubectl get ns demo
+
+Notes:
+
+
+==== PAGE BREAK ====
+======================================================================
+2. Frontend and OCI LB Integration (Free Tier Safe Path)
+Safe free-tier path to expose frontend via existing OCI Load Balancer.
+----------------------------------------------------------------------
+Goal: Expose the frontend via an existing OCI Load Balancer without
+creating new public LBs (avoids cost outside free tier). This section
+is an **alternative to deploying an Ingress Controller** (Section 5).
+
+Steps we followed:
+
+# 2A.1 Frontend Deployment
+- Applied ConfigMap `frontend-nginx-conf` with reverse proxy to backend.
+- Deployed frontend `nginx:1.25-alpine` using the ConfigMap mount.
+- Confirmed pod Running and Ready.
+
+# 2A.2 Service (NodePort)
+- Created Service `frontend` as type NodePort.
+- Pinned NodePort to 30080 for predictability.
+- Verified endpoints show the frontend pod IP and port.
+
+# 2A.3 Validate In-Cluster
+kubectl -n demo run testbox --rm -it --image=busybox:1.36 -- \
+  sh -c 'wget -qO- http://frontend.demo.svc.cluster.local/ && \
+         wget -qO- http://frontend.demo.svc.cluster.local/api'
+
+Expected:
+  - “Frontend OK — …”
+  - JSON from backend {title, message, note: Backend OK}
+
+# 2A.4 NodePort Curl (from worker/control plane)
+curl http://10.0.3.36:30080/
+curl http://10.0.3.120:30080/
+
+Confirmed 200 OK with “Frontend OK — …”.
+
+# 2A.5 OCI Security Rules
+- Worker subnet (10.0.3.0/24) ingress rule: allow TCP/30080 from LB subnet 10.0.4.0/24.
+- Worker subnet ingress rule: allow TCP/30080 from same subnet (10.0.3.0/24).
+
+# 2A.6 OCI LB Configuration
+- Backend Set: HTTP, port 30080, health check path `/`, Round Robin.
+- Backends: 10.0.3.36:30080 and 10.0.3.120:30080.
+- Listener: HTTP port 80 → backend set.
+- Health checks show “OK”.
+
+OCI CLI Equivalent Steps
+------------------------
+Note: This configuration can also be performed entirely in the OCI Console. 
+The following commands show how to achieve the same via the OCI CLI.
+
+2A.5 OCI Security Rules (CLI)
+-----------------------------
+```bash
+oci network security-list update \
+  --security-list-id <worker_subnet_seclist_ocid> \
+  --ingress-security-rules '[
+    {"protocol":"6","source":"10.0.4.0/24","tcpOptions":{"destinationPortRange":{"min":30080,"max":30080}}},
+    {"protocol":"6","source":"10.0.3.0/24","tcpOptions":{"destinationPortRange":{"min":30080,"max":30080}}}
+  ]'
+```
+
+2A.6 OCI LB Configuration (CLI)
+-------------------------------
+```bash
+# Create backend set
+oci lb backend-set create \
+  --load-balancer-id <lb_ocid> \
+  --name demo-backendset \
+  --policy ROUND_ROBIN \
+  --health-checker-protocol HTTP \
+  --health-checker-port 30080 \
+  --health-checker-url-path "/"
+
+# Add backends (worker nodes)
+oci lb backend create \
+  --load-balancer-id <lb_ocid> \
+  --backend-set-name demo-backendset \
+  --ip-address 10.0.3.36 \
+  --port 30080
+
+oci lb backend create \
+  --load-balancer-id <lb_ocid> \
+  --backend-set-name demo-backendset \
+  --ip-address 10.0.3.120 \
+  --port 30080
+
+# Create listener
+oci lb listener create \
+  --load-balancer-id <lb_ocid> \
+  --name demo-listener \
+  --default-backend-set-name demo-backendset \
+  --port 80 \
+  --protocol HTTP
+```
+
+
+# 2A.7 Testing
+From a node (or via port-forward):
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/api
+
+Expected output:
+  - / : “Frontend OK — …”
+  - /api : { "title": "Tiny In-Cluster Demo", "message": "Hello from Oracle K8s!", "note": "Backend OK" }
+
+Notes:
+- This path works with a private LB and free-tier networking. 
+- For external/laptop access, use port-forward or an SSH tunnel via a bastion to 30080.
+ If any command fails, fix before continuing.
+- If you need to re-run, 'kubectl delete ns demo' to clean slate.
+
+
+==== PAGE BREAK ====
+======================================================================
+3) Config (ConfigMap + Secret)
+Define environment settings using ConfigMap and Secret.
+----------------------------------------------------------------------
+# 3.1 Create ConfigMap (site settings)
+cat <<'EOF' > cm-demo.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-settings
+  namespace: demo
+data:
+  SITE_TITLE: "Tiny In-Cluster Demo"
+  WELCOME_MESSAGE: "Hello from Oracle K8s!"
+EOF
+
+kubectl apply -f cm-demo.yaml
+
+# 3.2 Create Secret (fake password for example)
+cat <<'EOF' > secret-demo.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: demo-secret
+  namespace: demo
+type: Opaque
+stringData:
+  DEMO_PASSWORD: "changeme123"
+EOF
+
+kubectl apply -f secret-demo.yaml
+
+# 3.3 Verify
+kubectl -n demo get cm demo-settings -o yaml
+kubectl -n demo get secret demo-secret -o yaml
+
+Notes: (add observations here)
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+4) Backend (tiny API) 
+Deploy a tiny FastAPI backend with a Service.
+----------------------------------------------------------------------
+# 4.1 Deployment
+cat <<'EOF' > deploy-backend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: api
+          # Simple Python HTTP server that returns JSON via a tiny app
+          image: ghcr.io/rdolliver/tiny-api:latest # (or, use 'python:3.11-slim' with inline cmd)
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SITE_TITLE
+              valueFrom:
+                configMapKeyRef:
+                  name: demo-settings
+                  key: SITE_TITLE
+            - name: WELCOME_MESSAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: demo-settings
+                  key: WELCOME_MESSAGE
+            - name: DEMO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-secret
+                  key: DEMO_PASSWORD
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+EOF
+
+# If you don't have an image published, use this alternative template:
+# (Uncomment below, comment out the one above, and re-apply.)
+#: <<'ALT'
+# cat <<'EOF' > deploy-backend.yaml
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: backend
+#   namespace: demo
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: backend
+#   template:
+#     metadata:
+#       labels:
+#         app: backend
+#     spec:
+#       containers:
+#         - name: api
+#           image: python:3.11-slim
+#           command: ["/bin/sh","-c"]
+#           args:
+#             - |
+#               pip install fastapi uvicorn && \
+#               python - <<'PY'
+#               from fastapi import FastAPI
+#               import os
+#               app = FastAPI()
+#               @app.get("/")
+#               def root():
+#                   return {
+#                     "title": os.getenv("SITE_TITLE","Demo"),
+#                     "message": os.getenv("WELCOME_MESSAGE","Hi"),
+#                     "note": "Backend OK"
+#                   }
+#               if __name__ == "__main__":
+#                   import uvicorn
+#                   uvicorn.run(app, host="0.0.0.0", port=8080)
+#               PY
+#           env:
+#             - name: SITE_TITLE
+#               valueFrom:
+#                 configMapKeyRef:
+#                   name: demo-settings
+#                   key: SITE_TITLE
+#             - name: WELCOME_MESSAGE
+#               valueFrom:
+#                 configMapKeyRef:
+#                   name: demo-settings
+#                   key: WELCOME_MESSAGE
+#           ports:
+#             - containerPort: 8080
+#           resources:
+#             requests:
+#               cpu: "50m"
+#               memory: "64Mi"
+#             limits:
+#               cpu: "250m"
+#               memory: "128Mi"
+# EOF
+# ALT
+
+kubectl apply -f deploy-backend.yaml
+
+# 4.2 Service (ClusterIP)
+cat <<'EOF' > svc-backend.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: demo
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+EOF
+
+kubectl apply -f svc-backend.yaml
+
+# 4.3 Verify
+kubectl -n demo get deploy,po,svc -l app=backend -o wide
+
+# 4.4 Test in-cluster
+kubectl -n demo run testbox --rm -it --image=busybox:1.36 -- /bin/sh -c 'wget -qO- http://backend.demo.svc.cluster.local:8080 || true'
+
+Notes:
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+5) Frontend (serves static + proxies /api)
+Deploy NGINX to serve static content and proxy requests to backend.
+----------------------------------------------------------------------
+# 5.1 Config (nginx.conf with simple reverse proxy)
+cat <<'EOF' > nginx-conf-cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-nginx-conf
+  namespace: demo
+data:
+  nginx.conf: |
+    events {}
+    http {
+      server {
+        listen 80;
+        location / {
+          return 200 'Frontend OK — $host\n';
+        }
+        location /api {
+          proxy_pass http://backend.demo.svc.cluster.local:8080/;
+        }
+      }
+    }
+EOF
+
+kubectl apply -f nginx-conf-cm.yaml
+
+# 5.2 Deployment
+cat <<'EOF' > deploy-frontend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25-alpine
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: frontend-nginx-conf
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+EOF
+
+kubectl apply -f deploy-frontend.yaml
+
+# 5.3 Service (LoadBalancer or NodePort)
+# Option A: LoadBalancer (preferred if OCI LB available)
+cat <<'EOF' > svc-frontend-lb.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+EOF
+
+# Option B: NodePort (uncomment if no LB)
+# cat <<'EOF' > svc-frontend-lb.yaml
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: frontend
+#   namespace: demo
+# spec:
+#   selector:
+#     app: frontend
+#   ports:
+#     - name: http
+#       port: 80
+#       targetPort: 80
+#       nodePort: 30080
+#   type: NodePort
+# EOF
+
+kubectl apply -f svc-frontend-lb.yaml
+
+# 5.4 Verify + get external endpoint
+kubectl -n demo get deploy,po,svc -l app=frontend -o wide
+# If LoadBalancer:
+kubectl -n demo get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
+# If NodePort:
+# kubectl get nodes -o wide  # pick a worker node EXTERNAL-IP
+# Then: curl http://<node_external_ip>:30080/
+
+Notes:
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+6) Ingress (optional, if you prefer a single hostname)
+Optional ingress controller and resource for hostname-based routing.
+----------------------------------------------------------------------
+# 6.1 Install NGINX Ingress Controller (one-liner manifest)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+
+# 6.2 Ingress resource
+cat <<'EOF' > ingress-demo.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-ingress
+  namespace: demo
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: demo.example.com   # change to your DNS name if you have one
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+EOF
+
+kubectl apply -f ingress-demo.yaml
+
+# 6.3 Verify Ingress
+kubectl -n demo get ingress demo-ingress -o wide
+
+Notes:
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+7) Autoscaling (HPA on backend)
+Add HPA to scale backend based on CPU utilization.
+----------------------------------------------------------------------
+# 7.1 Enable metrics (if not present)
+# (Kubeadm clusters often need metrics-server installed for HPA)
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# 7.2 HPA
+cat <<'EOF' > hpa-backend.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+EOF
+
+kubectl apply -f hpa-backend.yaml
+
+# 7.3 Generate load (temporary)
+kubectl -n demo run loadgen --rm -it --image=busybox:1.36 -- /bin/sh -c "while true; do wget -qO- http://backend.demo.svc.cluster.local:8080 > /dev/null; done"
+
+# 7.4 Watch HPA
+kubectl -n demo get hpa backend-hpa -w
+
+Notes:
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+8) Observability & Introspection
+Inspect objects, services, and logs for debugging and validation.
+----------------------------------------------------------------------
+# 8.1 Quick inventory
+kubectl -n demo get all -o wide
+
+# 8.2 Describe services
+kubectl -n demo describe svc frontend
+kubectl -n demo describe svc backend
+
+# 8.3 Logs
+kubectl -n demo logs deploy/backend -f
+kubectl -n demo logs deploy/frontend -f
+
+Notes:
+-
+
+
+==== PAGE BREAK ====
+======================================================================
+
+10) Cleanup
+Tear down demo resources to return cluster to baseline.
+----------------------------------------------------------------------
+kubectl delete ns demo
+# If you installed ingress-nginx for this demo only:
+# kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+
+
+==== PAGE BREAK ====
+======================================================================
+11) Scratchpad / Findings
+Record notes, issues, fixes, and improvement ideas.
+----------------------------------------------------------------------
+- Frontend external IP:
+- Ingress hostname / IP:
+- HPA max replicas observed:
+- OCI LB behavior:
+- Issues & fixes:
+- Next improvements:
+  - Add PV/PVC and a tiny DB
+  - Swap to your own container images
+  - Add TLS to Ingress
+
+
+==== PAGE BREAK ====
+======================================================================
+Appendix A) Free-Tier External Access Options
+----------------------------------------------------------------------
+Goal: Provide access to the demo app from your laptop without creating
+billable public LBs.
+
+Option 1: kubectl port-forward (simple)
+--------------------------------------
+kubectl -n demo port-forward svc/frontend 8080:80
+# then on the same node:
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/api
+
+Option 2: SSH tunnel via bastion (to NodePort)
+----------------------------------------------
+ssh -N -L 8080:10.0.3.36:30080 opc@<bastion_public_ip>
+# then on your laptop:
+curl http://localhost:8080/
+curl http://localhost:8080/api
+
+Option 3: SSH tunnel via bastion (to private LB)
+-----------------------------------------------
+ssh -N -L 8080:<LB_PRIVATE_IP>:80 opc@<bastion_public_ip>
+# then on your laptop:
+curl http://localhost:8080/
+curl http://localhost:8080/api
+
+Notes:
+- These methods allow safe, free-tier external testing.
+- Close the tunnel or stop port-forward when finished.
+
+
+==== PAGE BREAK ====
+======================================================================
+Appendix B) Deployment Issues and fixes
+----------------------------------------------------------------------
+
+CrashLoopBackOff (frontend)
+---------------------------
+- Symptom: `kubectl get pods` shows frontend restarting.
+- Likely cause: bad nginx.conf syntax (`return` line quotes).
+- Fix: use double quotes, add `add_header Content-Type` for plain text.
+- Verify: `kubectl logs deploy/frontend` for nginx error messages.
+
+ErrImagePull / ImagePullBackOff
+-------------------------------
+- Symptom: pods can’t pull images.
+- Likely cause: worker nodes have no Internet egress.
+- Fixes:
+  - Pre-pull base images on each node (crictl/nerdctl).
+  - Push images into OCI Registry (OCIR).
+  - Add NAT Gateway or Service Gateway for subnet.
+
+NodePort hangs
+--------------
+- Symptom: `curl http://<worker_ip>:30080/` hangs.
+- Likely cause: missing OCI Security List/NSG rules.
+- Fix:
+  - Add ingress rule: allow TCP/30080 from LB subnet (10.0.4.0/24).
+  - Add ingress rule: allow TCP/30080 from worker subnet itself (10.0.3.0/24).
+  - Confirm backends respond with: `curl http://10.0.3.36:30080/`.
+
+General Debug Commands
+----------------------
+- Inspect pod events:
+  kubectl -n demo describe pod <pod_name>
+- Check endpoints:
+  kubectl -n demo get endpoints frontend
+- Logs:
+  kubectl -n demo logs deploy/frontend --tail=50
+- Verify kube-proxy rules:
+  sudo iptables -t nat -L KUBE-NODEPORTS -n | grep 30080
+
+Notes:
+- Always verify app logic in-cluster (ClusterIP, Pod IP) before debugging NodePort or LB.
+- Check both Security Lists and NSGs if attached to your instances.
+
+
+==== PAGE BREAK ====
+
+======================================================================
+Appendix C) End-to-End Verification Checklist
+----------------------------------------------------------------------
+Goal: Prove each hop works, from pod to external entry point. Run in order.
+
+1) Pod responds (direct pod IP on its node)
+-------------------------------------------
+# Get pod IP and node
+kubectl -n demo get pods -l app=frontend -o wide
+# On the worker node hosting the pod:
+curl -s http://<FRONTEND_POD_IP>:80/ ; echo
+curl -s http://<FRONTEND_POD_IP>:80/api ; echo
+Success: plain text on / and JSON on /api
+
+2) Service ClusterIP responds
+-----------------------------
+kubectl -n demo get svc frontend -o wide
+curl -s http://<FRONTEND_CLUSTER_IP>:80/ ; echo
+curl -s http://<FRONTEND_CLUSTER_IP>:80/api ; echo
+Success: same as step 1
+
+3) DNS (Service name) resolves in-cluster
+-----------------------------------------
+kubectl -n demo run testbox --rm -it --image=busybox:1.36 --   sh -c 'wget -qO- http://frontend.demo.svc.cluster.local/ && echo &&          wget -qO- http://frontend.demo.svc.cluster.local/api && echo'
+Success: same as step 1
+
+4) NodePort reachable inside VCN
+--------------------------------
+# Worker node internal IPs
+kubectl get nodes -o wide
+# Try both workers
+curl -s http://<WORKER1_INTERNAL_IP>:30080/ ; echo
+curl -s http://<WORKER1_INTERNAL_IP>:30080/api ; echo
+curl -s http://<WORKER2_INTERNAL_IP>:30080/ ; echo
+curl -s http://<WORKER2_INTERNAL_IP>:30080/api ; echo
+Success: frontend responds; if it hangs, fix Security List/NSG rules.
+
+5) OCI Load Balancer (private) path
+-----------------------------------
+# From a node or via SSH tunnel through Bastion
+curl -s http://<LB_PRIVATE_IP>/ ; echo
+curl -s http://<LB_PRIVATE_IP>/api ; echo
+Success: same outputs; if unhealthy, check backend set and security rules.
+
+6) Bastion Host Tunnel for Laptop Access
+----------------------------------------
+# Option A: Port-forward
+kubectl -n demo port-forward svc/frontend 8080:80 &
+curl -s http://127.0.0.1:8080/ ; echo
+curl -s http://127.0.0.1:8080/api ; echo
+kill %1
+
+# Option B: SSH tunnel to NodePort
+ssh -N -L 8080:<WORKER1_INTERNAL_IP>:30080 opc@<bastion_public_ip>
+# In another terminal on your laptop:
+curl -s http://localhost:8080/ ; echo
+curl -s http://localhost:8080/api ; echo
+
+Success Criteria Summary
+------------------------
+- / returns:  Frontend OK — <host>
+- /api returns JSON with: { "title": ..., "message": ..., "note": "Backend OK" }
+- All 6 steps succeed without timeouts; failures map directly to the diagram:
+  - Pod/Service/DNS: inside cluster
+  - NodePort: worker node access
+  - OCI LB: private LB backend path
+  - Bastion: external laptop access
+
+
+Version v10
+- Updated Appendix C verification checklist to align with integrated OCI + Demo architecture.
+- Explicitly mapped each step to Bastion, NodePort, OCI LB, and app layer flows.
+
+
+Version v11
+- Numbered verification hops [1–6] directly on the integrated architecture diagram to mirror Appendix C steps.
